@@ -44,6 +44,13 @@ type freezerPlug struct {
 	frozen      bool
 	lastRequest time.Time
 
+	// restoring is true from the moment the first request triggers a restore
+	// until the restored process is accepting connections. restoreDone is the
+	// channel that restore-window requests block on; the restoring goroutine
+	// closes it when the restore completes. Both are guarded by mu.
+	restoring   bool
+	restoreDone chan struct{}
+
 	// fakeListener holds a TCP listener on the user-container port while the
 	// container is frozen. This keeps the queue-proxy's internal health probe
 	// succeeding so Knative continues routing traffic to the pod.
@@ -139,31 +146,50 @@ func (p *freezerPlug) waitForAppReady() error {
 func (p *freezerPlug) ApproveRequest(req *http.Request) (*http.Request, error) {
 	p.mu.Lock()
 	p.lastRequest = time.Now()
-	if !p.frozen {
+
+	if p.frozen {
+		// We're frozen — this goroutine owns the restore. Clear frozen and
+		// publish restoreDone before unlocking, so concurrent requests neither
+		// trigger a second restore (racing on LoadAndDelete in the daemon) nor
+		// get forwarded to a port that is not yet accepting: they observe
+		// restoring and block on restoreDone below.
+		p.stopFakeListener()
+		p.frozen = false
+		p.restoring = true
+		done := make(chan struct{})
+		p.restoreDone = done
 		p.mu.Unlock()
+
+		pi.Log.Infof("Freezer: thawing %s/%s before forwarding request", p.namespace, p.podName)
+		if err := p.callFreezer("resume"); err != nil {
+			pi.Log.Errorf("Freezer: thaw failed: %v", err)
+			// continue anyway — don't drop the request
+		} else if err := p.waitForAppReady(); err != nil {
+			pi.Log.Warnf("Freezer: %v", err)
+		}
+
+		p.mu.Lock()
+		p.restoring = false
+		p.restoreDone = nil
+		p.lastRequest = time.Now() // reset idle timer after restore to prevent immediate re-freeze
+		p.mu.Unlock()
+		close(done) // release any requests that arrived during the restore window
 		return req, nil
 	}
 
-	// We're frozen — this goroutine will handle the restore.
-	// Set frozen=false before unlocking so concurrent requests skip
-	// the restore path and don't race on LoadAndDelete in the daemon.
-	p.stopFakeListener()
-	p.frozen = false
-	p.mu.Unlock()
-
-	pi.Log.Infof("Freezer: thawing %s/%s before forwarding request", p.namespace, p.podName)
-	if err := p.callFreezer("resume"); err != nil {
-		pi.Log.Errorf("Freezer: thaw failed: %v", err)
-		// continue anyway — don't drop the request
-	} else {
-		if err := p.waitForAppReady(); err != nil {
-			pi.Log.Warnf("Freezer: %v", err)
-		}
-		p.mu.Lock()
-		p.lastRequest = time.Now() // reset idle timer after restore to prevent immediate re-freeze
+	if p.restoring {
+		// A restore is in flight: wait for it to complete before forwarding,
+		// so this request is not proxied to a port that is still down.
+		done := p.restoreDone
 		p.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		return req, nil
 	}
 
+	// Steady state: application is running, forward immediately.
+	p.mu.Unlock()
 	return req, nil
 }
 
@@ -193,9 +219,10 @@ func (p *freezerPlug) freezeLoop(ctx context.Context) {
 			p.mu.Lock()
 			idle := time.Since(p.lastRequest) > p.idleTimeout
 			frozen := p.frozen
+			restoring := p.restoring
 			p.mu.Unlock()
 
-			if idle && !frozen {
+			if idle && !frozen && !restoring {
 				pi.Log.Infof("Freezer: %s/%s idle, freezing containers", p.namespace, p.podName)
 				if err := p.callFreezer("pause"); err != nil {
 					pi.Log.Errorf("Freezer: freeze failed: %v", err)
