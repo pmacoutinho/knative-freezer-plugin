@@ -200,6 +200,17 @@ func (p *freezerPlug) ApproveResponse(req *http.Request, resp *http.Response) (*
 func (p *freezerPlug) Init(ctx context.Context, config map[string]string, serviceName string, namespace string, logger pi.Logger) context.Context {
 	pi.Log.Infof("Freezer plug initializing for %s/%s", namespace, p.podName)
 
+	// The operator passes the per-service idle timeout through the QPOption
+	// config (from the qpoption.knative.dev/freezer-config-idle-timeout
+	// annotation). When present it overrides the env-var default.
+	if v, ok := config["idle-timeout"]; ok {
+		var secs int
+		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil && secs > 0 {
+			p.idleTimeout = time.Duration(secs) * time.Second
+			pi.Log.Infof("Freezer: idle timeout set to %s from config", p.idleTimeout)
+		}
+	}
+
 	freezeCtx, cancel := context.WithCancel(ctx)
 	p.cancelFreezeLoop = cancel
 	go p.freezeLoop(freezeCtx)
